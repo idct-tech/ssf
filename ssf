@@ -1,0 +1,219 @@
+#!/usr/bin/php
+<?php
+
+/**
+ * Parses argv for arguments, flags and options.
+ *
+ * @return [ string[], string[string], boolean[string] ] $arguments, $options, $flags
+ */
+function parseArgv()
+{
+    global $argv;
+    $cliArgv = $argv;
+    array_shift($cliArgv);
+
+    $arguments = [];
+    $options = [];
+    $flags = [];
+
+    foreach($cliArgv as $candidate) {
+        $matches = [];
+        if(preg_match("/--([a-z0-9\-]+?)=(.*)/i", $candidate, $matches)) { //option
+            $options[$matches[1]] = $matches[2];
+        } elseif (preg_match("/-([a-z0-9]+?)$/i", $candidate, $matches)) { //flag
+            $flagLetters = str_split($matches[1]);
+            foreach ($flagLetters as $flagLetter) {
+                $flags[$flagLetter] = true;
+            }
+        } else {
+            $arguments[] = $candidate;
+            //argument
+        }
+    }
+
+    return [ $arguments, $options, $flags ];
+}
+
+// --------------------------------------[ VALIDATE INPUT ]-----------------------------------------
+
+list($args, $options, $flags) = parseArgv();
+
+$errors = [];
+if (!isset($options['search']) || empty($options['search'])) { //search is mandatory
+    $errors[] = "Missing search string.";
+}
+
+if (!isset($options['limit']) || empty($options['limit'])) { //limit is mandatory
+    $errors[] = "Missing search limit.";
+}
+
+if (!isset($args[0])) {
+    $errors[] = "Missing input file."; //file argument is mandatory
+    //TODO support multiple files
+}
+
+if (!file_exists($args[0]) || !is_readable($args[0])) {
+    //file must be readable
+    $errors[] = "Input file not readable.";
+}
+
+$buffered = isset($flags['b']); //buffered output
+$buffLen = isset($options['bufflen']) ? intval($options['bufflen']) : null; /* buffered output with
+bytes limit */
+$attemptFormat = isset($options['attempt-format']) ? $options['attempt-format'] : null; /* when used
+attempts to format output before printing; formatters: json, xml, serialized; activates -b auto-
+magically */
+
+// verify formatters chain
+$formatters = [];
+if ($attemptFormat) {
+    $formats = explode(',', $attemptFormat);
+    foreach ($formats as $format) {
+        if (in_array($format, ['xml', 'json', 'serialized'])) {
+            $formatters[] = $format;
+        } else {
+            $errors[] = "Unknown format: " . $format;
+        }
+    }
+}
+
+// verify bytes limited buffer value
+if ($buffLen !== null && $buffLen < 1) {
+    $errors[] = "bufflen (if set) must be a positive integer value.";
+} elseif ($buffLen > 1) {
+    $buffered = true;
+}
+
+//if any errors occured stop execution, print readme
+if (!empty($errors)) {
+    echo file_get_contents(__DIR__ . DIRECTORY_SEPARATOR . 'README.md');
+    fwrite(STDERR, "Errors:" . PHP_EOL . join(', ', $errors) . PHP_EOL);
+    exit(-1);
+}
+
+// --------------------------------------[ RUN PREPARATION ]----------------------------------------
+$handle = fopen($args[0], 'rb'); // try to open
+$fileSize = filesize($args[0]); // for progress printing
+
+$current = '';
+
+$position = 0; //for progress printing
+$searchSize = strlen($options['search']); //to know when to compare
+$limitSize = strlen($options['limit']); //to know when to compare
+$caseInsensitive = isset($flags['i']);
+$searchString = $caseInsensitive ? strtolower($options['search']) : $options['search'];
+$limitString = $caseInsensitive ? strtolower($options['limit']) : $options['limit'];
+$reportProgress = isset($flags['v']);
+$reportEof = isset($flags['e']);
+$global = isset($flags['g']); //if false will stop after first item is found
+$lastDataUnit = ''; //used when formatters are active
+
+$found = false; //when true means we found `start` and now collecting data until `limit`
+$cCount = 0; //ccurrently aggregated characters count (since last `start`)
+
+if ($buffered && $buffLen) { //if in the buffered bytes mode start it now
+    ob_start(null, $buffLen);
+}
+
+while (!feof($handle)) {
+    if (!$found) {
+        $letter = fread($handle, 1);
+        $current .= $letter;
+        if ($cCount >= $searchSize) {
+            $current = substr($current, 1);
+        } else {
+            $cCount++;
+        }
+
+        if (($caseInsensitive && strtolower($current) === $searchString) || (!$caseInsensitive && $current === $searchString)) {
+            if ($buffered && $buffLen === null) {
+                ob_start();
+            }
+            $found = true;
+            if (!$attemptFormat) {
+                echo $current;
+            } else {
+                $lastDataUnit .= $current;
+            }
+            $current = '';
+            $cCount = 0;
+        }
+    } else {
+        $letter = fread($handle, 1);
+        $current .= $letter;
+        if (!$attemptFormat) {
+            echo $letter;
+        } else {
+            $lastDataUnit .= $letter;
+        }
+
+        if ($cCount >= $limitSize) {
+            $current = substr($current, 1);
+        } else {
+            $cCount++;
+        }
+
+        if (($caseInsensitive && strtolower($current) === $limitString) || (!$caseInsensitive && $current === $limitString)) {
+            if ($attemptFormat) {
+                $success = false;
+                foreach ($formatters as $formatter) {
+                    if ($formatter === 'xml') {
+                        $unit = @simplexml_load_string($lastDataUnit);
+                        if ($unit !== false) {
+                            $dom = new DOMDocument("1.0");
+                            $dom->preserveWhiteSpace = false;
+                            $dom->formatOutput = true;
+                            $dom->loadXML($unit->asXML());
+                            echo $dom->saveXML();
+                            $success = true;
+                            break;
+                        }
+                    } elseif ($formatter === 'json') {
+                        $unit = @json_decode($lastDataUnit, true);
+                        if ($unit !== false) {
+                            echo json_encode($unit, JSON_PRETTY_PRINT);
+                            $success = true;
+                            break;
+                        }
+                    } elseif ($formatter === 'serlized') {
+                        $unit = @unserialize($lastDataUnit);
+                        if ($unit !== false) {
+                            echo var_dump($unit);
+                            $success = true;
+                            break;
+                        }
+                    }
+
+                    if (!$success) {
+                        echo $lastDataUnit;
+                    }
+                }
+            }
+            $lastDataUnit = '';
+            $found = false;
+            echo PHP_EOL;
+            if ($buffered && $buffLen === null) {
+                ob_end_flush();
+            }
+
+            if (!$global) {
+                fclose($handle);
+                exit;
+            } else {
+                $current = '';
+                $cCount = 0;
+            }
+        }
+    }
+    $position += 1;
+    if ($reportProgress) {
+        $percent = intval($position / $fileSize * 100);
+        if ($percent % 5 === 0) {
+            fwrite(STDERR, "%" . $percent . PHP_EOL);
+        }
+    }
+}
+
+if ($reportEof) {
+    fwrite(STDERR, "Reached EOF." . PHP_EOL);
+}
